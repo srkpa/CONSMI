@@ -8,7 +8,8 @@ import torch.nn.utils.rnn as rnn_utils
 
 
 class GPTConfig:
-    """ base GPT config, params common to all GPT versions """
+    """base GPT config, params common to all GPT versions"""
+
     embd_pdrop = 0.1
     resid_pdrop = 0.1
     attn_pdrop = 0.1
@@ -50,10 +51,15 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.n_embd, config.n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
         num = int(bool(config.num_props)) + int(
-            config.scaffold_maxlen)  # int(config.lstm_layers)    #  int(config.scaffold)
+            config.scaffold_maxlen
+        )  # int(config.lstm_layers)    #  int(config.scaffold)
         # num = 1
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size + num, config.block_size + num))
-                             .view(1, 1, config.block_size + num, config.block_size + num))
+        self.register_buffer(
+            "mask",
+            torch.tril(
+                torch.ones(config.block_size + num, config.block_size + num)
+            ).view(1, 1, config.block_size + num, config.block_size + num),
+        )
 
         self.n_head = config.n_head
 
@@ -61,18 +67,26 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        k = self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = (
+            self.key(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        q = (
+            self.query(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
+        v = (
+            self.value(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        )  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         attn_save = att
         att = self.attn_drop(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_drop(self.proj(y))
@@ -80,7 +94,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class Block(nn.Module):
-    """ an unassuming Transformer block """
+    """an unassuming Transformer block"""
 
     def __init__(self, config):
         super().__init__()
@@ -131,7 +145,7 @@ class MultiHeadAttention(nn.Module):
         context, attn = ScaledDotProductAttention()(Q, K, V, attn_mask)
         context = context.transpose(1, 2).reshape(batch_size, -1, config.n_embd)
         output = self.fc(context)
-        return nn.LayerNorm(config.n_embd).to('cuda:3')(output + residual), attn
+        return nn.LayerNorm(config.n_embd).to("cpu")(output + residual), attn
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -168,21 +182,37 @@ class TextEmbedding(nn.Module):
             nn.Linear(2048, src_vocab_size, bias=False),
         )
 
-    def forward(self, enc_inputs):
+    def forward(self, enc_inputs, return_embedding=False):
         b, t = enc_inputs.shape[0], enc_inputs.shape[1]
         attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)
-        token_embeddings = self.tok_emb(enc_inputs)  # each index maps to a (learnable) vector
-        position_embeddings = self.pos_emb[:, :t, :]  # each position maps to a (learnable) vector
-        type_embeddings = self.type_emb(torch.ones((b, t), dtype=torch.long, device=enc_inputs.device))
+        token_embeddings = self.tok_emb(
+            enc_inputs
+        )  # each index maps to a (learnable) vector
+        position_embeddings = self.pos_emb[
+            :, :t, :
+        ]  # each position maps to a (learnable) vector
+        type_embeddings = self.type_emb(
+            torch.ones((b, t), dtype=torch.long, device=enc_inputs.device)
+        )
         x = self.drop(token_embeddings + position_embeddings + type_embeddings)
+        all_attn = []  # ICI
         for layer in self.blocks:
             x, attn = layer(x, attn_mask)
+            all_attn.append(attn)
+
+        if return_embedding:
+            attn_weights = (
+                torch.stack(all_attn).mean(dim=0).mean(dim=1)
+            )  # (batch, seq_len, seq_len)
+            token_scores = torch.softmax(
+                attn_weights.sum(dim=1), dim=1
+            )  # (batch, seq_len)
+            x = (x * token_scores.unsqueeze(-1)).sum(dim=1)  # (batch, d_model)
+            return x  # shape: (batch, seq_len, d_model)
         logits = self.projection(x)
         if torch.isnan(logits).any():
             print(logits)
         return logits
-
-
 
 
 def get_attn_pad_mask(seq_q, seq_k):
@@ -194,20 +224,32 @@ def get_attn_pad_mask(seq_q, seq_k):
     """
     batch_size, len_q = seq_q.size()
     batch_size, len_k = seq_k.size()
-    pad_attn_mask = seq_k.data.eq(16).unsqueeze(1)  # [batch_size, 1, len_k], True is masked
+    pad_attn_mask = seq_k.data.eq(16).unsqueeze(
+        1
+    )  # [batch_size, 1, len_k], True is masked
     return pad_attn_mask.expand(batch_size, len_q, len_k)
 
 
 class Encoder(nn.Module):
-    def __init__(self, embedding_layer, hidden_size, num_layers,
-                 bidirectional, dropout, latent_size):
+    def __init__(
+        self,
+        embedding_layer,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        dropout,
+        latent_size,
+    ):
         super(Encoder, self).__init__()
 
         self.embedding_layer = embedding_layer
-        self.lstm_layer = nn.LSTM(30,
-                                  768, 3,
-                                  batch_first=True, dropout=0.2,
-                                  )
+        self.lstm_layer = nn.LSTM(
+            30,
+            768,
+            3,
+            batch_first=True,
+            dropout=0.2,
+        )
         # self.linear_layer = nn.Linear(
         #     (int(bidirectional) + 1) * num_layers * hidden_size,
         #     latent_size
@@ -215,7 +257,9 @@ class Encoder(nn.Module):
 
     def forward(self, x, lengths, hiddens=None):
         x = self.embedding_layer(x)
-        x = rnn_utils.pack_padded_sequence(x, lengths.to('cpu'), batch_first=True, enforce_sorted=False)
+        x = rnn_utils.pack_padded_sequence(
+            x, lengths.to("cpu"), batch_first=True, enforce_sorted=False
+        )
         x, hiddens = self.lstm_layer(x, hiddens)
         x, _ = rnn_utils.pad_packed_sequence(x, batch_first=True)
 
@@ -243,7 +287,9 @@ class NTXentLoss(nn.Module):
 
         positive_indices = labels_eq.fill_diagonal_(0)
 
-        positive_log_probs = torch.log_softmax(similarity_matrix, dim=1)[positive_indices]
+        positive_log_probs = torch.log_softmax(similarity_matrix, dim=1)[
+            positive_indices
+        ]
 
         loss = -positive_log_probs.mean()
 
